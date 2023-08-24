@@ -6,3 +6,11 @@ export enum MideaOperationalMode {
 	Heating = 4,
 	FanOnly = 5,
 }
+
+export enum MideaDehumidifierMode {
+	Off = 0,
+	Auto = 1,
+	Continuous = 2,
+	Dryer = 3,
+	Maximum = 4
+}

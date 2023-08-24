@@ -41,4 +41,5 @@ var MideaDeviceType;
     MideaDeviceType[MideaDeviceType["AirConditionFanner"] = 254] = "AirConditionFanner";
     MideaDeviceType[MideaDeviceType["AllType"] = 255] = "AllType";
 })(MideaDeviceType = exports.MideaDeviceType || (exports.MideaDeviceType = {}));
+;
 //# sourceMappingURL=MideaDeviceType.js.map

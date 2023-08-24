@@ -1,6 +1,6 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.MideaOperationalMode = void 0;
+exports.MideaDehumidifierMode = exports.MideaOperationalMode = void 0;
 var MideaOperationalMode;
 (function (MideaOperationalMode) {
     MideaOperationalMode[MideaOperationalMode["Off"] = 0] = "Off";
@@ -10,4 +10,12 @@ var MideaOperationalMode;
     MideaOperationalMode[MideaOperationalMode["Heating"] = 4] = "Heating";
     MideaOperationalMode[MideaOperationalMode["FanOnly"] = 5] = "FanOnly";
 })(MideaOperationalMode = exports.MideaOperationalMode || (exports.MideaOperationalMode = {}));
+var MideaDehumidifierMode;
+(function (MideaDehumidifierMode) {
+    MideaDehumidifierMode[MideaDehumidifierMode["Off"] = 0] = "Off";
+    MideaDehumidifierMode[MideaDehumidifierMode["Auto"] = 1] = "Auto";
+    MideaDehumidifierMode[MideaDehumidifierMode["Continuous"] = 2] = "Continuous";
+    MideaDehumidifierMode[MideaDehumidifierMode["Dryer"] = 3] = "Dryer";
+    MideaDehumidifierMode[MideaDehumidifierMode["Maximum"] = 4] = "Maximum";
+})(MideaDehumidifierMode = exports.MideaDehumidifierMode || (exports.MideaDehumidifierMode = {}));
 //# sourceMappingURL=MideaOperationalMode.js.map

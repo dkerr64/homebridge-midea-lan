@@ -1,84 +1,102 @@
-import { PlatformAccessory, CharacteristicValue, CharacteristicSetCallback, CharacteristicGetCallback } from 'homebridge';
+/***********************************************************************
+ * Midea-Lan Platform Accessory class
+ *
+ * Copyright (c) 2023 David Kerr
+ *
+ * Based on https://github.com/homebridge/homebridge-plugin-template
+ * With thanks to https://github.com/hillaliy/homebridge-midea-lan
+ *
+ * An instance of this class is created for each accessory the platform registers.
+ *
+ */
+import { PlatformAccessory } from 'homebridge';
 import { MideaPlatform } from './MideaPlatform';
-import { MideaDeviceType } from './enums/MideaDeviceType';
-import { MideaSwingMode } from './enums/MideaSwingMode';
+import { MideaDeviceType, airconditionerState, dehumidifierState } from './enums/MideaDeviceType';
+import Semaphore from 'semaphore-promise';
 export declare class MideaAccessory {
-    private readonly platform;
-    private readonly accessory;
-    private _deviceId;
-    private _deviceType;
-    private _name;
-    private _address;
+    readonly platform: MideaPlatform;
+    readonly accessory: PlatformAccessory;
     deviceId: string;
     deviceType: MideaDeviceType;
-    targetTemperature: any;
-    indoorTemperature: number;
-    outdoorTemperature: number;
-    useFahrenheit: boolean;
-    ecoMode: boolean;
-    turboMode: boolean;
-    turboFan: boolean;
-    purifier: boolean;
-    dryer: boolean;
-    comfortSleep: boolean;
-    showScreen: boolean;
-    currentHumidity: number;
-    targetHumidity: any;
-    tankLevel: number;
-    powerState: any;
-    beepPrompt: boolean;
-    operationalMode: number;
-    fanSpeed: number;
-    verticalSwing: boolean;
-    horizontalSwing: boolean;
-    fanOnlyMode: boolean;
-    temperatureSteps: number;
-    minTemperature: number;
-    maxTemperature: number;
-    supportedSwingMode: MideaSwingMode;
     name: string;
     model: string;
     address: string;
+    token: string;
+    key: string;
     firmwareVersion: any;
+    semaphore: Semaphore;
+    appliance: any;
+    deviceState: airconditionerState | dehumidifierState | undefined;
+    private temperatureSteps;
+    private minTemperature;
+    private maxTemperature;
+    private minHumidity;
+    private maxHumidity;
     private service;
-    private fanService;
-    private outdoorTemperatureService;
-    constructor(platform: MideaPlatform, accessory: PlatformAccessory, _deviceId: string, _deviceType: MideaDeviceType, _name: string, _address: string);
-    handleActiveGet(callback: CharacteristicGetCallback): void;
-    handleActiveSet(value: CharacteristicValue, callback: CharacteristicSetCallback): void;
-    currentHeaterCoolerState(): 0 | 2 | 3;
-    handleCurrentHeaterCoolerStateGet(callback: CharacteristicGetCallback): void;
-    targetHeaterCoolerState(): 1 | 0 | 2;
-    handleTargetHeaterCoolerStateGet(callback: CharacteristicGetCallback): void;
-    handleTargetHeaterCoolerStateSet(value: CharacteristicValue, callback: CharacteristicSetCallback): void;
-    handleCurrentTemperatureGet(callback: CharacteristicGetCallback): void;
-    handleThresholdTemperatureGet(callback: CharacteristicGetCallback): void;
-    handleThresholdTemperatureSet(value: CharacteristicValue, callback: CharacteristicSetCallback): void;
-    rotationSpeed(): number;
-    handleRotationSpeedGet(callback: CharacteristicGetCallback): void;
-    handleRotationSpeedSet(value: CharacteristicValue, callback: CharacteristicSetCallback): void;
-    SwingMode(): 1 | 0;
-    handleSwingModeGet(callback: CharacteristicGetCallback): void;
-    handleSwingModeSet(value: CharacteristicValue, callback: CharacteristicSetCallback): void;
-    handleTemperatureDisplayUnitsGet(callback: CharacteristicGetCallback): void;
-    handleTemperatureDisplayUnitsSet(value: CharacteristicValue, callback: CharacteristicSetCallback): void;
-    fanActive(): 1 | 0;
-    handleFanActiveGet(callback: CharacteristicGetCallback): void;
-    handleFanActiveSet(value: CharacteristicValue, callback: CharacteristicSetCallback): void;
-    handleOutdoorTemperatureGet(callback: CharacteristicGetCallback): void;
-    currentHumidifierDehumidifierState(): 0 | 3 | undefined;
-    handleCurrentHumidifierDehumidifierStateGet(callback: CharacteristicGetCallback): void;
-    TargetHumidifierDehumidifierState(): 2 | undefined;
-    handleTargetHumidifierDehumidifierStateGet(callback: CharacteristicGetCallback): void;
-    handleTargetHumidifierDehumidifierStateSet(value: CharacteristicValue, callback: CharacteristicSetCallback): void;
-    handleCurrentRelativeHumidityGet(callback: CharacteristicGetCallback): void;
-    handleRelativeHumidityDehumidifierThresholdGet(callback: CharacteristicGetCallback): void;
-    handleRelativeHumidityDehumidifierThresholdSet(value: CharacteristicValue, callback: CharacteristicSetCallback): void;
-    handleRelativeHumidityHumidifierThresholdGet(callback: CharacteristicGetCallback): void;
-    handleRelativeHumidityHumidifierThresholdSet(value: CharacteristicValue, callback: CharacteristicSetCallback): void;
-    windSpeed(): number;
-    handleWindSpeedGet(callback: CharacteristicGetCallback): void;
-    handleWindSpeedSet(value: CharacteristicValue, callback: CharacteristicSetCallback): void;
-    handleWaterLevelGet(callback: CharacteristicGetCallback): void;
+    /*********************************************************************
+     *
+     */
+    constructor(platform: MideaPlatform, accessory: PlatformAccessory);
+    /*********************************************************************
+     * initialize the accessory.
+     */
+    init(this: MideaAccessory): Promise<void>;
+    /*********************************************************************
+     * initialize air conditioner accessory.
+     */
+    private initAirConditioner;
+    /*********************************************************************
+     * initialize dehumidifier accessory.
+     */
+    private initDehumidifier;
+    /*********************************************************************
+     * retrieve status from device, whether humidifier or air conditioner
+     */
+    private retrieveDeviceState;
+    /*********************************************************************
+     * AIR CONDITIONER and DEHUMIDIFIER helper functions follow....
+     *
+     */
+    private handleActiveGet;
+    private handleActiveSet;
+    private SwingMode;
+    private handleSwingModeGet;
+    private handleSwingModeSet;
+    /*********************************************************************
+     * AIR CONDITIONER specific helper functions follow....
+     *
+     */
+    private currentHeaterCoolerState;
+    private handleCurrentHeaterCoolerStateGet;
+    private targetHeaterCoolerState;
+    private handleTargetHeaterCoolerStateGet;
+    private handleTargetHeaterCoolerStateSet;
+    private handleCurrentTemperatureGet;
+    private handleThresholdTemperatureGet;
+    private handleThresholdTemperatureSet;
+    private rotationSpeed;
+    private handleRotationSpeedGet;
+    private handleRotationSpeedSet;
+    private handleTemperatureDisplayUnitsGet;
+    private handleTemperatureDisplayUnitsSet;
+    private fanActive;
+    private handleFanActiveGet;
+    private handleFanActiveSet;
+    private handleOutdoorTemperatureGet;
+    /*********************************************************************
+     * DEHUMIDIFIER specific helper functions follow....
+     *
+     */
+    private currentHumidifierDehumidifierState;
+    private handleCurrentHumidifierDehumidifierStateGet;
+    private handleTargetHumidifierDehumidifierStateGet;
+    private handleTargetHumidifierDehumidifierStateSet;
+    private handleCurrentRelativeHumidityGet;
+    private handleRelativeHumidityDehumidifierThresholdGet;
+    private handleRelativeHumidityDehumidifierThresholdSet;
+    private WindSpeed;
+    private handleWindSpeedGet;
+    private handleWindSpeedSet;
+    private handleWaterLevelGet;
 }
 //# sourceMappingURL=MideaAccessory.d.ts.map

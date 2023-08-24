@@ -1,35 +1,79 @@
-import { API, DynamicPlatformPlugin, Logger, PlatformAccessory, PlatformConfig, Service, Characteristic } from 'homebridge';
+/***********************************************************************
+ * Midea-Lan Homebridge Platform class
+ *
+ * Copyright (c) 2023 David Kerr
+ *
+ * Based on https://github.com/homebridge/homebridge-plugin-template
+ * With thanks to https://github.com/hillaliy/homebridge-midea-lan
+ *
+ * This class is the main constructor for the plugin.
+ */
 
+import { API,
+  DynamicPlatformPlugin,
+  Logger,
+  PlatformAccessory,
+  PlatformConfig,
+  Service,
+  Characteristic,
+} from 'homebridge';
 import { PLATFORM_NAME, PLUGIN_NAME } from './settings';
 import { MideaAccessory } from './MideaAccessory';
 
+// For bridge to midea-beautiful-air that is written in python...
 const { py, python } = require('pythonia');
+
+// To access network interface detail...
+import os from 'os';
+const Netmask = require('netmask').Netmask;
+
+type deviceConfig = {
+  name: string;
+  ip: string;
+  token: string;
+  key: string;
+  type: number;
+};
+type deviceList = {
+  [deviceId: string]: deviceConfig;
+};
 
 export class MideaPlatform implements DynamicPlatformPlugin {
   public readonly Service: typeof Service = this.api.hap.Service;
   public readonly Characteristic: typeof Characteristic = this.api.hap.Characteristic;
-  public readonly accessories: PlatformAccessory[] = [];
-  mideaAccessories: MideaAccessory[] = [];
 
-  midea_beautiful: any;
-  cloud: any;
-  updateInterval: any = null;
-  refreshTimeout: any = null;
-  appCredentials: any;
-  appliances: any;
-  devices: any = [];
+  private readonly accessories: PlatformAccessory[] = [];
+  private readonly allCachedDeviceIds: string[] = [];
+  private readonly mideaAccessories: MideaAccessory[] = [];
 
-  accessToken: string = '';
-  key: string = '';
+  private midea_beautiful: any;
+  private cloud: object = {};
+  private appCredentials: object;
 
+  /*********************************************************************
+   *
+   */
   constructor(
     public readonly log: Logger,
     public readonly config: PlatformConfig,
     public readonly api: API,
   ) {
     this.log.debug('Finished initializing platform:', this.config.name);
-    this.log = log;
-    this.config = config;
+    Error.stackTraceLimit = 100;
+    // transform config list of devices into object that can be indexed by deviceId...
+    const devices = {};
+    if (this.config.devices) {
+      this.config.devices.forEach(x => devices[String(x.deviceId).toLowerCase()] = x.config);
+    };
+    this.config.devices = devices;
+    // Set defaults
+    this.config.broadcastRetry ??= 2;    // seconds
+    this.config.broadcastTimeout ??= 2;  // seconds
+    this.config.interval ??= 30;         // seconds to retrieve device status
+    this.config.appCredentials ??= 'NetHomePlus';
+    this.config.useDeviceList ??= false;
+
+    this.log.debug(`Config:\n${JSON.stringify(this.config, null, 2)}`);
 
     this.appCredentials = {
       NetHomePlus: {
@@ -56,247 +100,315 @@ export class MideaPlatform implements DynamicPlatformPlugin {
         proxied: "v5",
       },
     };
+
     api.on('didFinishLaunching', () => {
       this.onReady();
-      this.log.debug('Executed didFinishLaunching callback');
     });
-  }
+  };
 
-  async onReady() {
-    try {
-      this.midea_beautiful = await python('midea_beautiful');
-      this.log.debug('Load "midea_beautiful" successful');
-      this.cloud = await this.login();
-      try {
-        await this.getDeviceList();
-        await this.updateDevices();
-      } catch (error) {
-        this.log.debug('getDeviceList failed');
-      }
-      this.updateInterval = setInterval(() => {
-        this.updateDevices();
-      }, this.config['interval'] * 60 * 1000);
-    } catch (error) {
-      this.log.debug('Load "midea_beautiful" failed');
-    }
-  }
-
+  /*********************************************************************
+   * This function is invoked when homebridge restores cached accessories
+   * from disk at startup.
+   */
   configureAccessory(accessory: PlatformAccessory) {
     this.log.info(`Loading accessory from cache: ${accessory.displayName}`);
     // add the restored accessory to the accessories cache so we can track if it has already been registered
     this.accessories.push(accessory);
+    // so we can quickly find out if device is already cached
+    this.allCachedDeviceIds.push(accessory.context.deviceId);
+  };
+
+  /*********************************************************************
+   * onReady
+   * Homebridge has finished its initalization.  We now get all Midea devices
+   * Logic...
+   * 1) If we have a config.devices array then it is assumed to contain valid
+   *    ip/Id/Token/Key and we do not do any device discovery, else...
+   * 2) Do a local LAN discovery by broadcast, compare resulting list with list
+   *    of previously cached accessories, if all previously existed then use
+   *    cached list as it already contains Token/Key pairs, else...
+   * 3) We need to find Token/Key pairs.  Login to Midea cloud service and do
+   *    a local LAN discovery.  Update cached Token/Key pairs and/or register
+   *    new Homebridge accessories.
+   */
+  private async onReady() {
+    try {
+      this.midea_beautiful = await python('midea_beautiful');
+      this.log.info('Load "midea_beautiful" successful');
+      try {
+        let devList: deviceList = this.config.devices;
+        if (devList && this.config.useDeviceList) {
+          // if devList exists then we assume that deviceId/ip/token/key are all
+          // valid and use those.
+          this.log.info('Configure devices from config file devices list');
+          this.log.warn('WARNING: All fields (deviceId/name/ip/token/key/type) are assumed to be present and correct');
+        } else {
+          // Nothing defined in config file. Do a local LAN discovery
+          devList = await this.getDeviceList(null);
+          if (!Object.keys(devList).every(elem => this.allCachedDeviceIds.includes(elem))) {
+            // We have discovered new devices not previously cached, re-do discovery
+            // with cloud login so that we can retrieve token/key pairs for each device.
+            this.log.info('Something changed, login to cloud to retrieve new token/key pairs');
+            this.cloud = await this.login();
+            devList = await this.getDeviceList(this.cloud);
+          };
+        };
+        this.log.debug(`Devices List:\n${JSON.stringify(devList)}`);
+        await this.addAccessories(devList);
+      } catch (e) {
+        const msg = (e instanceof Error) ? e.stack : e;
+        this.log.error('Fatal error during plugin initialization:\n' + msg);
+      };
+    } catch (e) {
+      const msg = (e instanceof Error) ? e.stack : e;
+      this.log.error('Load "midea_beautiful" failed:\n' + msg);
+    };
+  };
+
+  /*********************************************************************
+   * ifBroadcastAddrs
+   * find_appliances by default broadcasts to 255.255.255.255 which only gets sent out on the first
+   * network interface.  This function finds all network interfaces and returns the broadcast address
+   * for each in an array, e.g. ['192.168.1.255', '192.168.100.255'].  If there are multiple interfaces
+   * this will cause broadcast to be sent out on each interface so all appliances are properly discovered.
+   */
+  private ifBroadcastAddrs(): string[] {
+    let list: string[] = [];
+    try {
+      const ifaces: Object = os.networkInterfaces();
+      for (let iface in ifaces) {
+        for (let i in ifaces[iface]) {
+          const f = ifaces[iface][i];
+          if (!f.internal && f.family === 'IPv4') {
+            // only IPv4 addresses excluding any loopback interface
+            list.push(new Netmask(f.cidr).broadcast);
+          }
+        }
+      }
+    } catch (e) {
+      const msg = (e instanceof Error) ? e.stack : e;
+      this.log.error('Fatal error during plugin initialization:\n' + msg);
+    }
+    this.log.info(`Broadcast addresses: ${JSON.stringify(list)}`);
+    return (list);
   }
 
-  async login() {
+  /*********************************************************************
+   * login
+   */
+  private async login(): Promise<object> {
     try {
       const cloud = await this.midea_beautiful.connect_to_cloud$({
-        account: this.config['user'],
-        password: this.config['password'],
-        ...this.appCredentials[this.config['appCredentials']],
+        account: this.config.user,
+        password: this.config.password,
+        ...this.appCredentials[this.config.appCredentials],
       });
       const cloudDict = await cloud.__dict__;
       this.log.debug(cloudDict);
-      this.accessToken = cloudDict.accessToken;
-      this.key = cloudDict.key;
       this.log.info('Login successful');
       return cloud;
-    } catch (error: any) {
-      this.log.error(error);
+    } catch (e) {
+      const msg = (e instanceof Error) ? e.stack : e;
+      throw new Error('Login to Midea cloud failed, check user/password credentials\n' + msg);
     }
   }
 
-  async getDeviceList() {
+  /*********************************************************************
+   * getDeviceList
+   * Find all devices on LAN by sending broadcast over network(s).  If cloud object
+   * provided then additionally connect to Midea cloud service to retrieve Token / Key
+   */
+  private async getDeviceList(cloud: any): Promise<deviceList> {
+    let devList: deviceList = {};
     try {
-      this.log.info('Getting devices');
-      this.appliances = await this.midea_beautiful.find_appliances$({
-        cloud: this.cloud,
-      });
-      this.log.debug(`Found ${await this.appliances.length} devices`);
+      let appliances: any;
+      if (cloud) {
+        this.log.info('Getting devices with Cloud and LAN discovery');
+        appliances = await this.midea_beautiful.find_appliances$({
+          cloud: cloud,
+          addresses: this.ifBroadcastAddrs(),
+          retries: this.config.broadcastRetry,
+          timeout: this.config.broadcastTimeout,
+        });
+      } else {
+        this.log.info('Getting devices with local LAN discovey');
+        appliances = await this.midea_beautiful.find_appliances$({
+          addresses: this.ifBroadcastAddrs(),
+          retries: this.config.broadcastRetry,
+          timeout: this.config.broadcastTimeout,
+        });
+      }
+      this.log.info(`Found ${await appliances.length} device(s)`);
+      this.log.debug(appliances);
 
-      for await (const [index, app] of await py.enumerate(this.appliances)) {
+      for await (const [index, app] of await py.enumerate(appliances)) {
+        // Loop through each device in discovered list and build device list array
         this.log.debug(await app);
-        const appJsonString = this.pythonToJson(
-          await app.state.__dict__.__str__(),
-        );
-        const appJson = JSON.parse(appJsonString);
-        const id = appJson.id;
-        this.devices[id] = appJson;
-
-        let deviceType: any;
-        if (appJson.type === 'ac') {
+        const appJson: any = this.pythonToJson(await app.state.__dict__.__str__());
+        let deviceType = appJson.type;
+        if (deviceType.toLowerCase() === 'ac') {
           deviceType = 172;
-        } else if (appJson.type === 'dh') {
+        } else if (deviceType.toLowerCase() === 'dh') {
           deviceType = 161;
         } else {
-          this.log.warn(`Device: ${appJson.name} is of unsupported type: ${appJson.type}`)
-          this.log.warn('Please open an issue on GitHub with your specific device model')
+          deviceType = Number(deviceType);
         }
+        if (deviceType === 172 || deviceType === 161) {
+          this.log.info(`Found: ${appJson.name} (${appJson.id}) at ${await app.address}`);
+          devList[appJson.id] = {
+            ip: await app.address,
+            token: await app.token, // could be undefined or empty string if list discovered LAN only
+            key: await app.key,     // could be undefined or empty string if list discovered LAN only
+            name: appJson.name,     // could be undefined if list discovered LAN only
+            type: deviceType,
+          };
+        } else {
+          this.log.warn(`Device: ${appJson.name} (${appJson.id}) at ${await app.address} is of unsupported type: ${appJson.type} (${Number(deviceType)})`);
+          this.log.warn('Please open an issue on GitHub with your specific device model');
+        }
+      }
+    } catch (e) {
+      const msg = (e instanceof Error) ? e.stack : e;
+      this.log.error('Fatal error getting device list:\n' + msg);
+    }
+    return devList;
+  }
 
-        const uuid = this.api.hap.uuid.generate(appJson.id);
+  /*********************************************************************
+   * addAccessories
+   */
+  private async addAccessories(devList: deviceList): Promise<any> {
+    try {
+      let configMsg: string = '';
+      for (const [deviceId, config] of Object.entries(devList)) {
+        let accessory: PlatformAccessory | undefined = undefined;
+        const uuid = this.api.hap.uuid.generate(`MideaLan-${deviceId}`);
         const existingAccessory = this.accessories.find(accessory => accessory.UUID === uuid);
 
         if (existingAccessory) {
-          this.log.debug(`Restoring existing accessory from cache: ${existingAccessory.displayName}`);
-          existingAccessory.context.deviceId = appJson.id;
-          existingAccessory.context.name = appJson.name;
-          existingAccessory.context.type = deviceType;
-          existingAccessory.context.address = appJson.address;
-
-          this.api.updatePlatformAccessories([existingAccessory]);
-
-          const ma = new MideaAccessory(this, existingAccessory, appJson.id, deviceType, appJson.name, appJson.address);
-          this.mideaAccessories.push(ma);
-
-          this.configureAccessory(existingAccessory);
+          accessory = existingAccessory;
+          this.log.info(`Restoring existing accessory from cache: ${accessory.displayName}`);
+          this.log.debug(`Context: ${JSON.stringify(accessory.context)}`);
         } else {
-          this.log.debug(`Adding new device: ${appJson.name}`);
-          const accessory = new this.api.platformAccessory(appJson.name, uuid);
-          accessory.context.deviceId = appJson.id;
-          accessory.context.name = appJson.name;
-          accessory.context.type = deviceType;
-          accessory.context.address = appJson.address;
-
-          const ma = new MideaAccessory(this, accessory, appJson.id, deviceType, appJson.name, appJson.address);
+          this.log.info(`Adding new device: ${config.name}`);
+          accessory = new this.api.platformAccessory(config.name, uuid);
           this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
-          this.mideaAccessories.push(ma);
-
-          this.configureAccessory(accessory);
         }
-      }
-    } catch (error: any) {
-      this.log.error(error);
-    }
-  }
-
-  async updateDevices() {
-    try {
-      this.accessories.forEach(async (accessory: PlatformAccessory) => {
-        this.log.debug(`Updating accessory: ${accessory.context.name} (${accessory.context.deviceId})`)
-        let applianceType: any;
-        if (accessory.context.type === 172) {
-          applianceType = 'ac';
-        } else if (accessory.context.type === 161) {
-          applianceType = 'dh';
+        accessory.context.deviceId = deviceId;  // Should never change
+        accessory.context.address = config.ip;  // Could change if DHCP reassigned
+        accessory.context.type = Number(config.type);   // A number
+        if (config.token && config.token.length > 0) {
+          this.log.debug('Updating Name/Token/Key in accessory context');
+          accessory.context.token = config.token;
+          accessory.context.key = config.key;
+          accessory.context.name = config.name;
         }
-        let applianceState: any;
+        this.api.updatePlatformAccessories([accessory]);
 
-        if (accessory.context.address) {
-          this.log.debug(`Update device ${accessory.context.name} (${accessory.context.deviceId}) via lan`);
-          applianceState = await this.midea_beautiful.appliance_state$({
-            address: accessory.context.address,
-            token: accessory.context.token,
-            key: accessory.context.key,
-            appliance_id: accessory.context.deviceId,
-          });
+        // Log configuration that could be copied/pasted into config file
+        if (configMsg.length > 0) {
+          configMsg = ',\n  {\n';
         } else {
-          this.log.debug(`Update device ${accessory.context.name} (${accessory.context.deviceId}) via cloud`);
-          applianceState = await this.midea_beautiful.appliance_state$({
-            cloud: this.cloud,
-            use_cloud: true,
-            appliance_id: accessory.context.deviceId,
-            appliance_type: applianceType,
-          });
-        };
-
-        this.log.debug(await applianceState);
-        const stateString = this.pythonToJson(
-          await applianceState.state.__dict__.__str__(),
-        );
-        const stateJson = JSON.parse(stateString);
-        let mideaAccessory: any = this.mideaAccessories.find(ma => ma.deviceId === accessory.context.deviceId)
-
-        mideaAccessory.powerState = stateJson.running ? 1 : 0;
-        mideaAccessory.beepPrompt = stateJson.beep_prompt;
-        mideaAccessory.operationalMode = stateJson.mode;
-        mideaAccessory.fanSpeed = stateJson.fan_speed;
-        mideaAccessory.verticalSwing = stateJson.vertical_swing;
-        mideaAccessory.horizontalSwing = stateJson.horizontal_swing;
-        if (accessory.context.type === 172) {
-          mideaAccessory.targetTemperature = stateJson.target_temperature;
-          mideaAccessory.indoorTemperature = stateJson.indoor_temperature;
-          mideaAccessory.outdoorTemperature = stateJson.outdoor_temperature;
-          mideaAccessory.useFahrenheit = stateJson.fahrenheit;
-          mideaAccessory.turboFan = stateJson.turbo_fan;
-          mideaAccessory.ecoMode = stateJson.eco_mode;
-          mideaAccessory.turboMode = stateJson.turbo;
-          mideaAccessory.purifier = stateJson.purifier;
-          mideaAccessory.dryer = stateJson.dryer;
-          mideaAccessory.comfortSleep = stateJson.comfort_sleep;
-          mideaAccessory.showScreen = stateJson.show_screen;
-
-          this.log.debug(`\nPower state: ${mideaAccessory.powerState}\nBeep prompt: ${mideaAccessory.beepPrompt}\nOperational mode: ${mideaAccessory.operationalMode}\nFan speed: ${mideaAccessory.fanSpeed}\nTarget temperature: ${mideaAccessory.targetTemperature}\nIndoor temperature: ${mideaAccessory.indoorTemperature}\nOutdoor temperature: ${mideaAccessory.outdoorTemperature}\nVertical swing: ${mideaAccessory.verticalSwing}\nHorizontal swing: ${mideaAccessory.horizontalSwing}\nFahrenheit: ${mideaAccessory.useFahrenheit}\nturbo fan: ${mideaAccessory.turboFan}\nEco mode: ${mideaAccessory.ecoMode}\nTurbo mode: ${mideaAccessory.turboMode}\nPurifier: ${mideaAccessory.purifier}\nDryer: ${mideaAccessory.dryer}\nComfort sleep: ${mideaAccessory.comfortSleep}\nShow screen: ${mideaAccessory.showScreen}`)
-
-        } else if (accessory.context.type === 161) {
-          mideaAccessory.currentHumidity = stateJson.current_humidity;
-          mideaAccessory.targetHumidity = stateJson.target_humidity;
-          mideaAccessory.tankLevel = stateJson.tank_level;
-
-          this.log.debug(`\nPower state: ${mideaAccessory.powerState}\nBeep prompt: ${mideaAccessory.beepPrompt}\nOperational mode: ${mideaAccessory.operationalMode}\nFan speed: ${mideaAccessory.fanSpeed}\nCurrent humidity: ${mideaAccessory.currentHumidity}\nTarget humidity: ${mideaAccessory.targetHumidity}\nTank level: ${mideaAccessory.tankLevel}\nVertical swing: ${mideaAccessory.verticalSwing}\nHorizontal swing: ${mideaAccessory.horizontalSwing}`)
+          configMsg = '  {\n';
         }
-      })
-    } catch (error: any) {
-      this.log.error(error);
+        configMsg += `    "deviceId": "${deviceId}",\n`;
+        configMsg += `    "config": {\n`;
+        configMsg += `      "name": "${accessory.context.name}",\n`;
+        configMsg += `      "ip": "${accessory.context.address}",\n`;
+        configMsg += `      "token": "${accessory.context.token}",\n`;
+        configMsg += `      "key": "${accessory.context.key}",\n`;
+        configMsg += `      "type": ${Number(accessory.context.type)}\n`;
+        configMsg += `    }\n  }`;
+        const ma = new MideaAccessory(this, accessory);
+        await ma.init();
+        this.mideaAccessories.push(ma);
+      }
+      this.log.info(`Devices configuration:\n"devices": [\n${configMsg}\n]`);
+    } catch (e) {
+      const msg = (e instanceof Error) ? e.stack : e;
+      this.log.error('Fatal error adding accessories:\n' + msg);
     }
   }
 
-  async sendUpdateToDevice(device?: MideaAccessory) {
-    if (device) {
-      const deviceId: any = device.deviceId.split("."[2]);
-      const command: any = device.deviceId.split(".").pop();
-      const index = Object.keys(this.devices).indexOf(deviceId);
-      const appliance = await this.appliances[index];
-      const setState = { cloud: this.cloud };
-      let cmd: any = [];
-      cmd.running = device.powerState
-      cmd.beep_prompt = device.beepPrompt;
-      cmd.mode = device.operationalMode;
-      cmd.fan_speed = device.fanSpeed;
-      cmd.vertical_swing = device.verticalSwing;
-      cmd.horizontal_swing = device.horizontalSwing;
-      if (device.deviceType === 172) {
-        cmd.target_temperature = device.targetTemperature;
-        cmd.fahrenheit = device.useFahrenheit;
-        cmd.eco_mode = device.ecoMode;
-        cmd.turbo = device.turboMode;
-      } else if (device.deviceType === 161) {
-        cmd.target_humidity = device.targetHumidity;
-      }
-      setState[command] = cmd;
-      this.log.debug(`Send command to: ${device.name} (${device.deviceId})`);
-      console.log(setState)
-      try {
-        await appliance.set_state$(setState);
-      } catch (error: any) {
-        this.log.error(error);
-      }
-    };
+  /*********************************************************************
+   * getDeviceState
+   */
+  public async getDeviceState(device: MideaAccessory): Promise<object> {
+    // serialize sending commands to the device
+    const releaseSemaphore = await device.semaphore.acquire('Obtain device semaphore for retrieve');
+    try {
+      this.log.debug(`Retieving state for accessory: ${device.name} (${device.deviceId})`);
+      const appliance = await this.midea_beautiful.appliance_state$({
+        address: device.address,
+        token: device.token,
+        key: device.key,
+        appliance_id: device.deviceId,
+      });
+      device.appliance = appliance;
+      this.log.debug(await appliance);
+      return this.pythonToJson(await appliance.state.__dict__.__str__());
+    } catch (e) {
+      const msg = (e instanceof Error) ? e.stack : e;
+      throw new Error('Error in getDeviceState:\n' + msg);
+    } finally {
+      releaseSemaphore();
+    }
   };
 
-  pythonToJson(objectString: any) {
-    objectString = objectString
-      .replaceAll(/b'[^']*'/g, '\'\'')
-      .replaceAll(/: <[^<]*>,/g, ':\'\',')
-      .replaceAll('{\'_', '{\'')
-      .replaceAll(', \'_', ', \'')
-      .replaceAll('\'', '"')
-      .replaceAll(' None,', 'null,')
-      .replaceAll(' True,', 'true,')
-      .replaceAll(' False,', 'false,');
-
-    this.log.debug(objectString);
-    return objectString;
+  /*********************************************************************
+   * sendUpdateToDevice
+   */
+  public async sendUpdateToDevice(device: MideaAccessory, values: { [attribute: string]: number | boolean; }) {
+    const context = device.accessory.context;
+    // serialize sending commands to the device
+    const releaseSemaphore = await device.semaphore.acquire('Obtain device semaphore for send command');
+    try {
+      const appliance = (device.appliance) ? device.appliance :
+        await this.midea_beautiful.appliance_state$({
+          address: context.address,
+          token: context.token,
+          key: context.key,
+          appliance_id: context.deviceId,
+        });
+      this.log.info(`Send command to: ${context.name} (${context.deviceId}): ${JSON.stringify(values)}`);
+      await appliance.set_state$(values);
+      // set state can take time, log when we return here
+      this.log.debug(`Command success to: ${context.name} (${context.deviceId}): ${JSON.stringify(values)}`);
+    } catch (e) {
+      const msg = (e instanceof Error) ? e.stack : e;
+      this.log.error('Error setting appliance state:\n' + msg);
+    } finally {
+      releaseSemaphore();
+    }
   };
 
-  getDeviceSpecificOverrideValue(deviceId: string, key: string) {
-    if (this.config) {
-      if (this.config.hasOwnProperty('devices')) {
-        for (let i = 0; i < this.config.devices.length; i++) {
-          if (this.config.devices[i].deviceId === deviceId) {
-            return this.config.devices[i][key];
-          };
-        };
-      };
+  /*********************************************************************
+   * pythonToJson helper function
+   * converts python string objects to javascript objects
+   */
+  private pythonToJson(objectString: string): object {
+    try {
+      this.log.debug(`PY in: ${objectString}`);
+      objectString = objectString
+        .replaceAll(/b'[^']*'/g, '\'\'') // binary data bounded in single quotes ignored
+        .replaceAll(/b"[^"]*"/g, '\"\"') // binary data bounded in double quotes ignored
+        .replaceAll(/: <[^<]*>,/g, ':\'\',')
+        .replaceAll('{\'_', '{\'')
+        .replaceAll(', \'_', ', \'')
+        .replaceAll('\'', '"')
+        .replaceAll(': None', ': null')
+        .replaceAll(': True', ': true')
+        .replaceAll(': False', ': false');
+      this.log.debug(`JSON out: ${objectString}`);
+      const json = JSON.parse(objectString);
+      this.log.debug(`Parsed object:\n${JSON.stringify(json, null, 2)}`);
+      return json;
+    } catch (e) {
+      // if something goes wrong don't crash out.  May be temporary problem.
+      // Return empty object, hopefully next pass through it will work.
+      const msg = (e instanceof Error) ? e.stack : e;
+      this.log.error('Error converting from python to json:\n' + msg);
+      return {};
     };
-    return null;
   };
 };
